@@ -13,6 +13,7 @@ import {
 } from "echarts/components";
 import PageHeader from "../components/PageHeader.vue";
 import PageState from "../components/PageState.vue";
+import { baseChart, axisLabel } from "../charts/theme";
 import { decisionApi } from "../api";
 import { errorMessage } from "../api/http";
 import { useAuthStore } from "../stores/auth";
@@ -183,13 +184,22 @@ async function confirm(option: DecisionOption) {
   }
 }
 const scoreChart = computed(() => ({
-  tooltip: { trigger: "axis" },
-  grid: { left: 35, right: 15, top: 20, bottom: 28 },
+  ...baseChart,
+  tooltip: { ...baseChart.tooltip, trigger: "axis" },
+  grid: { left: 35, right: 15, top: 24, bottom: 30 },
   xAxis: {
     type: "category",
     data: selected.value?.options.map((x) => x.name) || [],
+    axisLine: { lineStyle: { color: "#e7eaf1" } },
+    axisTick: { show: false },
+    axisLabel,
   },
-  yAxis: { type: "value", max: 100 },
+  yAxis: {
+    type: "value",
+    max: 100,
+    axisLabel,
+    splitLine: { lineStyle: { color: "#e9ecf1", type: "dashed" } },
+  },
   series: [
     {
       type: "bar",
@@ -200,14 +210,18 @@ const scoreChart = computed(() => ({
   ],
 }));
 const radarChart = computed(() => ({
-  tooltip: {},
-  legend: { bottom: 0 },
+  ...baseChart,
+  tooltip: { ...baseChart.tooltip },
+  legend: { ...baseChart.legend, bottom: 0 },
   radar: {
     indicator: (selected.value?.metrics || []).map((x) => ({
       name: x.name,
       max: 100,
     })),
     radius: "62%",
+    axisName: { color: "#667085", fontSize: 12 },
+    splitLine: { lineStyle: { color: "#e7eaf1" } },
+    splitArea: { areaStyle: { color: ["#fafbfd", "#f3f5f8"] } },
   },
   series: [
     {

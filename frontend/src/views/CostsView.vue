@@ -9,6 +9,7 @@ import { LegendComponent, TooltipComponent } from "echarts/components";
 import PageHeader from "../components/PageHeader.vue";
 import PageState from "../components/PageState.vue";
 import MetricCard from "../components/MetricCard.vue";
+import { baseChart, donutTotal } from "../charts/theme";
 import { financeApi, taskApi } from "../api";
 import { errorMessage } from "../api/http";
 import { useProjectStore } from "../stores/projects";
@@ -107,24 +108,40 @@ async function addExpense() {
     ElMessage.error(errorMessage(e));
   }
 }
+const pieTotal = computed(() => {
+  const s = summary.value;
+  return s
+    ? s.labor_cost +
+        s.equipment_cost +
+        s.cloud_cost +
+        s.procurement_cost +
+        s.other_cost
+    : 0;
+});
 const chart = computed(() => ({
-  tooltip: { trigger: "item", formatter: "{b}<br/>¥{c}（{d}%）" },
-  legend: { bottom: 0 },
+  ...baseChart,
+  tooltip: {
+    ...baseChart.tooltip,
+    trigger: "item",
+    formatter: "{b}<br/>¥{c}（{d}%）",
+  },
+  legend: { ...baseChart.legend, bottom: 0 },
+  title: donutTotal(money(pieTotal.value), "实际投入总额"),
   series: [
     {
       type: "pie",
-      radius: ["48%", "72%"],
-      center: ["50%", "43%"],
-      itemStyle: { borderRadius: 7, borderColor: "#fff", borderWidth: 3 },
-      data: summary.value
-        ? [
-            { name: "人力", value: summary.value.labor_cost },
-            { name: "设备", value: summary.value.equipment_cost },
-            { name: "云服务", value: summary.value.cloud_cost },
-            { name: "采购", value: summary.value.procurement_cost },
-            { name: "其他", value: summary.value.other_cost },
-          ]
-        : [],
+      radius: ["58%", "80%"],
+      center: ["50%", "44%"],
+      padAngle: 2,
+      itemStyle: { borderRadius: 8 },
+      label: { show: false },
+      data: [
+        { name: "人力", value: summary.value?.labor_cost || 0 },
+        { name: "设备", value: summary.value?.equipment_cost || 0 },
+        { name: "云服务", value: summary.value?.cloud_cost || 0 },
+        { name: "采购", value: summary.value?.procurement_cost || 0 },
+        { name: "其他", value: summary.value?.other_cost || 0 },
+      ].filter((x) => x.value > 0),
     },
   ],
 }));

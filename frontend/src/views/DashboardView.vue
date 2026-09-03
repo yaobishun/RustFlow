@@ -12,6 +12,7 @@ import {
 import PageHeader from "../components/PageHeader.vue";
 import PageState from "../components/PageState.vue";
 import MetricCard from "../components/MetricCard.vue";
+import { baseChart, donutTotal, axisLabel } from "../charts/theme";
 import { dashboardApi } from "../api";
 import { errorMessage } from "../api/http";
 import type { Dashboard } from "../types";
@@ -45,15 +46,22 @@ onMounted(() => {
   load();
   window.addEventListener("rustflow:project-change", load);
 });
+const taskTotal = computed(() =>
+  Object.values(data.value?.task_distribution || {}).reduce((a, b) => a + b, 0),
+);
 const taskChart = computed(() => ({
-  tooltip: { trigger: "item" },
-  legend: { bottom: 0 },
+  ...baseChart,
+  tooltip: { ...baseChart.tooltip, trigger: "item", formatter: "{b}<br/>{c} 项 · {d}%" },
+  legend: { ...baseChart.legend, bottom: 0 },
+  title: donutTotal(String(taskTotal.value), "任务总数"),
   series: [
     {
       type: "pie",
-      radius: ["52%", "74%"],
-      center: ["50%", "43%"],
-      itemStyle: { borderRadius: 7, borderWidth: 3, borderColor: "#fff" },
+      radius: ["58%", "80%"],
+      center: ["50%", "44%"],
+      padAngle: 2,
+      itemStyle: { borderRadius: 8 },
+      label: { show: false },
       data: Object.entries(data.value?.task_distribution || {}).map(
         ([name, value]) => ({ name, value }),
       ),
@@ -61,26 +69,54 @@ const taskChart = computed(() => ({
   ],
 }));
 const costChart = computed(() => ({
-  tooltip: { trigger: "axis" },
-  grid: { left: 30, right: 15, top: 20, bottom: 28 },
+  ...baseChart,
+  tooltip: {
+    ...baseChart.tooltip,
+    trigger: "axis",
+    axisPointer: { lineStyle: { color: "rgba(16,24,40,.14)" } },
+  },
+  grid: { left: 42, right: 16, top: 22, bottom: 30 },
   xAxis: {
     type: "category",
+    boundaryGap: false,
     data: (data.value?.cost_trend || []).map((x) => x.date),
     axisLine: { show: false },
     axisTick: { show: false },
+    axisLabel,
   },
   yAxis: {
     type: "value",
     axisLine: { show: false },
-    splitLine: { lineStyle: { color: "#eef1f6" } },
+    axisTick: { show: false },
+    axisLabel: {
+      ...axisLabel,
+      formatter: (v: number) =>
+        v >= 10000
+          ? `¥${(v / 10000).toFixed(1)}w`
+          : v >= 1000
+            ? `¥${(v / 1000).toFixed(0)}k`
+            : String(v),
+    },
+    splitLine: { lineStyle: { color: "#e9ecf1", type: "dashed" } },
   },
   series: [
     {
       type: "line",
-      smooth: true,
-      symbolSize: 7,
-      areaStyle: { color: "rgba(33,97,238,.1)" },
-      lineStyle: { width: 3, color: "#2161ee" },
+      smooth: 0.4,
+      symbol: "circle",
+      symbolSize: 6,
+      showSymbol: false,
+      lineStyle: { width: 2.5, color: "#2161ee" },
+      areaStyle: {
+        color: {
+          type: "linear",
+          x: 0, y: 0, x2: 0, y2: 1,
+          colorStops: [
+            { offset: 0, color: "rgba(33,97,238,.16)" },
+            { offset: 1, color: "rgba(33,97,238,0)" },
+          ],
+        },
+      },
       data: (data.value?.cost_trend || []).map((x) => x.value),
     },
   ],
@@ -128,15 +164,7 @@ const money = (v: number) => `¥${Number(v || 0).toLocaleString()}`;
               <h3>任务状态分布</h3>
               <p>当前团队任务流转概况</p>
             </div>
-            <span class="count-badge"
-              >{{
-                Object.values(data.task_distribution || {}).reduce(
-                  (a, b) => a + b,
-                  0,
-                )
-              }}
-              项</span
-            >
+
           </div>
           <VChart class="chart" :option="taskChart" autoresize />
         </div>

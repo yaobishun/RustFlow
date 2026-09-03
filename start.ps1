@@ -51,6 +51,8 @@ $backendErr = Join-Path $runDir 'backend.err.log'
 $frontendOut = Join-Path $runDir 'frontend.out.log'
 $frontendErr = Join-Path $runDir 'frontend.err.log'
 
+$env:BIND_ADDR = '127.0.0.1:3100'
+
 $backend = Start-Process -FilePath 'cargo' `
     -ArgumentList @('run', '--manifest-path', (Join-Path $backendDir 'Cargo.toml')) `
     -WorkingDirectory $backendDir `
