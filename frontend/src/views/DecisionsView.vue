@@ -160,6 +160,35 @@ async function evaluate() {
     ElMessage.error(errorMessage(e));
   }
 }
+const metricDialog = ref(false);
+const metricSaving = ref(false);
+const metricForm = ref<DecisionMetric[]>([]);
+function openMetrics() {
+  if (!selected.value) return;
+  metricForm.value = selected.value.metrics.map((m) => ({ ...m }));
+  metricDialog.value = true;
+}
+const metricTotalWeight = computed(() =>
+  metricForm.value.reduce((s, x) => s + Number(x.weight || 0), 0),
+);
+async function saveMetrics() {
+  if (!selected.value) return;
+  if (metricTotalWeight.value !== 100) {
+    return ElMessage.warning("评价指标权重合计必须等于 100%");
+  }
+  metricSaving.value = true;
+  try {
+    await decisionApi.updateMetrics(selected.value.id, metricForm.value);
+    selected.value = await decisionApi.evaluate(selected.value.id);
+    metricDialog.value = false;
+    ElMessage.success("指标已更新并重新评价");
+    await load();
+  } catch (e) {
+    ElMessage.error(errorMessage(e));
+  } finally {
+    metricSaving.value = false;
+  }
+}
 async function confirm(option: DecisionOption) {
   if (!selected.value || !option.id) return;
   try {
@@ -224,6 +253,11 @@ const radarChart = computed(() => ({
   ],
 }));
 const money = (v?: number) => `¥${Number(v || 0).toLocaleString()}`;
+const rowClass = ({ row }: { row: DecisionOption }) =>
+  row.feasible === false ? "infeasible-row" : "";
+const recommendedOption = computed(() =>
+  selected.value?.options?.find((x) => x.rank === 1 && x.feasible !== false),
+);
 onMounted(async () => {
   await projects.load().catch(() => undefined);
   await load();
@@ -284,11 +318,20 @@ onMounted(async () => {
               v-if="
                 canManage &&
                 !selectedArchived &&
-                selected.status !== 'confirmed'
+                selected.status === 'draft'
               "
               type="primary"
               @click="evaluate"
               >执行评价计算</el-button
+            >
+            <el-button
+              v-else-if="
+                canManage &&
+                !selectedArchived &&
+                selected.status === 'evaluated'
+              "
+              @click="evaluate"
+              >重新评价计算</el-button
             >
           </div>
           <el-alert
@@ -314,8 +357,60 @@ onMounted(async () => {
             :closable="false"
             show-icon
             ><template #title>系统推荐：{{ selected.recommendation }}</template>
-            <p>{{ selected.recommendation_reason }}</p></el-alert
+            <p>{{ selected.recommendation_reason }}</p>
+            <div
+              v-if="
+                canManage &&
+                !selectedArchived &&
+                selected.status === 'evaluated' &&
+                recommendedOption
+              "
+              class="recommend-action"
+              ><el-button
+                type="success"
+                @click="confirm(recommendedOption)"
+                >确认选择此方案</el-button
+              ><span
+                >也可在下方结果表的「操作」列对任意候选方案单独确认</span
+              ></div
+            ></el-alert
           >
+          <div class="panel metrics-panel">
+            <div class="panel-head">
+              <h3>评价指标与硬约束</h3>
+              <el-button
+                v-if="
+                  canManage &&
+                  !selectedArchived &&
+                  selected.status !== 'confirmed'
+                "
+                size="small"
+                @click="openMetrics"
+                >调整指标</el-button
+              >
+            </div>
+            <el-table
+              :data="selected.metrics"
+              size="small"
+              empty-text="暂无指标"
+              ><el-table-column prop="name" label="指标" min-width="110"
+              /><el-table-column label="方向" width="95"
+                ><template #default="{ row }">{{
+                  row.direction === "higher" ? "越大越好" : "越小越好"
+                }}</template></el-table-column
+              ><el-table-column label="权重" width="70"
+                ><template #default="{ row }">{{ row.weight }}%</template></el-table-column
+              ><el-table-column label="单位" width="70"
+                ><template #default="{ row }">{{ row.unit || "—" }}</template></el-table-column
+              ><el-table-column label="硬约束" min-width="170"
+                ><template #default="{ row }"
+                  ><span v-if="row.threshold != null" class="threshold-badge"
+                    >{{ row.direction === "higher" ? "≥" : "≤"
+                    }}{{ row.threshold }} {{ row.unit || "" }}</span
+                  ><span v-else class="no-threshold">无硬约束</span></template
+                ></el-table-column
+            ></el-table>
+          </div>
           <div
             v-if="selected.status !== 'draft'"
             class="grid two dashboard-charts"
@@ -335,16 +430,30 @@ onMounted(async () => {
             </div>
           </div>
           <div class="panel table-panel">
-            <el-table :data="selected.options" empty-text="尚未添加候选方案"
+            <el-table
+              :data="selected.options"
+              :row-class-name="rowClass"
+              empty-text="尚未添加候选方案"
               ><el-table-column label="排名" width="65"
                 ><template #default="{ row, $index }">{{
                   row.rank || $index + 1
                 }}</template></el-table-column
-              ><el-table-column
-                prop="name"
-                label="候选方案"
-                min-width="130"
-              /><el-table-column label="TCO"
+              ><el-table-column label="候选方案" min-width="150"
+                ><template #default="{ row }"
+                  ><span>{{ row.name }}</span
+                  ><el-tag
+                    v-if="row.feasible === false"
+                    type="danger"
+                    size="small"
+                    class="infeasible-tag"
+                    >违反硬约束</el-tag
+                  ><span
+                    v-if="row.feasible === false && row.violations?.length"
+                    class="violations"
+                    >{{ row.violations.join("、") }}</span
+                  ></template
+                ></el-table-column
+              ><el-table-column label="TCO"
                 ><template #default="{ row }">{{
                   row.tco === undefined ? "待计算" : money(row.tco)
                 }}</template></el-table-column
@@ -384,8 +493,8 @@ onMounted(async () => {
                       !selectedArchived &&
                       selected?.status === 'evaluated'
                     "
-                    link
-                    type="primary"
+                    size="small"
+                    type="success"
                     @click="confirm(row)"
                     >确认选择</el-button
                   ><el-tag
@@ -446,6 +555,18 @@ onMounted(async () => {
             ><template #default="{ row }">{{
               row.direction === "higher" ? "越大越好" : "越小越好"
             }}</template></el-table-column
+          ><el-table-column label="硬约束阈值" min-width="150"
+            ><template #default="{ row }"
+              ><el-input-number
+                v-model="row.threshold"
+                :min="0"
+                :controls="false"
+                placeholder="可选"
+                class="threshold-input"
+              /><span class="threshold-hint"
+                >{{ row.direction === "higher" ? "≥" : "≤" }} 留空则无约束</span
+              ></template
+            ></el-table-column
           ><el-table-column label="权重"
             ><template #default="{ row }"
               ><el-input-number
@@ -534,6 +655,49 @@ onMounted(async () => {
           :disabled="form.options.length < 2"
           @click="create"
           >创建决策</el-button
+        ></template
+      ></el-dialog
+    >
+    <el-dialog
+      v-model="metricDialog"
+      title="调整评价指标与硬约束"
+      width="min(720px,96vw)"
+      top="8vh"
+      ><div class="weight-total" :class="{ invalid: metricTotalWeight !== 100 }">
+        当前权重合计 <b>{{ metricTotalWeight }}%</b>
+      </div>
+      <el-table :data="metricForm" size="small"
+        ><el-table-column prop="name" label="指标" min-width="120"
+        /><el-table-column label="方向" width="95"
+          ><template #default="{ row }">{{
+            row.direction === "higher" ? "越大越好" : "越小越好"
+          }}</template></el-table-column
+        ><el-table-column label="权重(%)" width="130"
+          ><template #default="{ row }"
+            ><el-input-number
+              v-model="row.weight"
+              :min="0"
+              :max="100" /></template></el-table-column
+        ><el-table-column label="硬约束阈值" min-width="160"
+          ><template #default="{ row }"
+            ><el-input-number
+              v-model="row.threshold"
+              :min="0"
+              :controls="false"
+              placeholder="留空=无约束"
+            /><span class="threshold-hint"
+              >{{ row.direction === "higher" ? "≥" : "≤" }} {{ row.unit }}</span
+            ></template
+          ></el-table-column
+      ></el-table>
+      <template #footer
+        ><el-button @click="metricDialog = false">取消</el-button
+        ><el-button
+          type="primary"
+          :loading="metricSaving"
+          :disabled="metricTotalWeight !== 100"
+          @click="saveMetrics"
+          >保存并重新评价</el-button
         ></template
       ></el-dialog
     >
