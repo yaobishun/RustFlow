@@ -1,0 +1,18 @@
+.project-switcher { margin-left: auto; width: 190px; }
+.project-switcher + .user-area { margin-left: 0; }
+.milestone-strip { display: grid; grid-template-columns: repeat(auto-fit,minmax(180px,1fr)); gap: 10px; }
+.milestone-strip > div { display:flex; align-items:center; gap:10px; padding:12px; background:#f7f8fb; border-radius:9px; }
+.milestone-strip > div > div { display:flex; flex-direction:column; gap:4px; }
+.milestone-strip b { font-size:12px; }
+.milestone-strip small { color:#7a8498; font-size:10px; }
+.role-developer [data-page="项目管理"] .page-actions,
+.role-reviewer [data-page="项目管理"] .page-actions,
+.role-developer [data-page="团队与成员"] .page-actions,
+.role-reviewer [data-page="团队与成员"] .page-actions,
+.role-developer [data-page="风险预警"] .page-actions,
+.role-reviewer [data-page="风险预警"] .page-actions { display:none; }
+.role-developer [data-page="任务看板"] .page-actions .el-button:last-child,
+.role-reviewer [data-page="任务看板"] .page-actions .el-button:last-child { display:none; }
+@media (max-width: 760px) {
+  .project-switcher { width: 120px; margin-left: auto; }
+}
