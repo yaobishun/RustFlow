@@ -51,21 +51,31 @@ $backendErr = Join-Path $runDir 'backend.err.log'
 $frontendOut = Join-Path $runDir 'frontend.out.log'
 $frontendErr = Join-Path $runDir 'frontend.err.log'
 
-$backend = Start-Process -FilePath 'cargo' `
-    -ArgumentList @('run', '--manifest-path', (Join-Path $backendDir 'Cargo.toml')) `
-    -WorkingDirectory $backendDir `
-    -RedirectStandardOutput $backendOut `
-    -RedirectStandardError $backendErr `
-    -WindowStyle Hidden `
-    -PassThru
+# 完全脱离当前终端启动服务：把命令包进 cmd.exe /c，在子 shell 里重定向
+# stdout/stderr 并把 stdin 指向 NUL。这样避免 Start-Process 的
+# -RedirectStandardOutput/-RedirectStandardError（Windows PowerShell 5.1 下会让
+# 子进程持有当前控制台输入，导致终端启动后卡住、无法继续输入）。
+function Start-Detached {
+    param(
+        [string]$CommandLine,
+        [string]$WorkingDirectory,
+        [string]$OutFile,
+        [string]$ErrFile
+    )
 
-$frontend = Start-Process -FilePath 'npm.cmd' `
-    -ArgumentList @('--prefix', $frontendDir, 'run', 'dev', '--', '--host', '127.0.0.1') `
-    -WorkingDirectory $frontendDir `
-    -RedirectStandardOutput $frontendOut `
-    -RedirectStandardError $frontendErr `
-    -WindowStyle Hidden `
-    -PassThru
+    $wrapped = "$CommandLine > `"$OutFile`" 2> `"$ErrFile`" < NUL"
+    Start-Process -FilePath 'cmd.exe' `
+        -ArgumentList @('/c', $wrapped) `
+        -WorkingDirectory $WorkingDirectory `
+        -WindowStyle Hidden `
+        -PassThru
+}
+
+$backendCmd = "cargo run --manifest-path `"$(Join-Path $backendDir 'Cargo.toml')`""
+$frontendCmd = "npm.cmd --prefix `"$frontendDir`" run dev -- --host 127.0.0.1"
+
+$backend = Start-Detached -CommandLine $backendCmd -WorkingDirectory $backendDir -OutFile $backendOut -ErrFile $backendErr
+$frontend = Start-Detached -CommandLine $frontendCmd -WorkingDirectory $frontendDir -OutFile $frontendOut -ErrFile $frontendErr
 
 Set-Content -LiteralPath $backendPidFile -Value $backend.Id
 Set-Content -LiteralPath $frontendPidFile -Value $frontend.Id

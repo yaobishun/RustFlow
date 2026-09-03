@@ -14,7 +14,7 @@ function Stop-RustFlowProcessTree {
 
     $target = Get-Process -Id $RootProcessId -ErrorAction SilentlyContinue
     if ($target) {
-        Stop-Process -Id $RootProcessId -Force
+        Stop-Process -Id $RootProcessId -Force -ErrorAction SilentlyContinue
     }
 }
 

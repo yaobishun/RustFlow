@@ -192,9 +192,26 @@ pub struct CreateDecisionMetric {
     pub direction: String,
     #[serde(default)]
     pub unit: String,
+    /// 硬约束阈值（可选）。higher 指标要求值 >= 阈值，lower 指标要求值 <= 阈值。
+    #[serde(default)]
+    pub threshold: Option<f64>,
 }
 #[derive(Debug, Deserialize)]
 pub struct ConfirmDecision {
     pub option_id: i64,
     pub reason: String,
+}
+#[derive(Debug, Deserialize)]
+pub struct UpdateDecisionMetrics {
+    pub metrics: Vec<UpdateDecisionMetric>,
+}
+#[derive(Debug, Deserialize)]
+pub struct UpdateDecisionMetric {
+    pub id: i64,
+    pub weight_bps: i64,
+    pub direction: String,
+    #[serde(default)]
+    pub unit: String,
+    #[serde(default)]
+    pub threshold: Option<f64>,
 }

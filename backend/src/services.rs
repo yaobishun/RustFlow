@@ -153,25 +153,79 @@ pub fn roi_bps(benefit: i64, total_cost: i64) -> ApiResult<i64> {
     Ok((((benefit - total_cost) as i128 * 10_000) / total_cost as i128) as i64)
 }
 
+/// 等值（无区分度）指标归一化后的中性分。避免"所有方案数值相同却拿满分"虚增优势。
+const NEUTRAL_SCORE: f64 = 50.0;
+/// 样本量达到该阈值时才启用分位缩尾，避免小样本下分位估计失真。
+const WINSORIZE_MIN_N: usize = 10;
+const WINSORIZE_LOWER: f64 = 0.05;
+const WINSORIZE_UPPER: f64 = 0.95;
+
 pub fn normalize(values: &[f64], higher_is_better: bool) -> Vec<f64> {
     if values.is_empty() {
         return vec![];
     }
-    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
-    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    if (max - min).abs() < f64::EPSILON {
-        return vec![100.0; values.len()];
+    if values.len() == 1 {
+        // 单方案没有比较基准，给中性分。
+        return vec![NEUTRAL_SCORE];
     }
-    values
-        .iter()
-        .map(|&v| {
+    let mut v = values.to_vec();
+    if values.len() >= WINSORIZE_MIN_N {
+        // 抗离群：先对两端做分位缩尾，避免单一极端值压扁其余分差。
+        winsorize(&mut v, WINSORIZE_LOWER, WINSORIZE_UPPER);
+    }
+    let min = v.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = v.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if (max - min).abs() < f64::EPSILON {
+        // 全部相等（或缩尾后相等）：无区分度，给中性分。
+        return vec![NEUTRAL_SCORE; values.len()];
+    }
+    v.iter()
+        .map(|&x| {
             if higher_is_better {
-                (v - min) / (max - min) * 100.0
+                (x - min) / (max - min) * 100.0
             } else {
-                (max - v) / (max - min) * 100.0
+                (max - x) / (max - min) * 100.0
             }
         })
         .collect()
+}
+
+/// 判断一组值是否无区分度（全部相等，或仅一个值）。
+pub fn is_uniform(values: &[f64]) -> bool {
+    if values.len() < 2 {
+        return true;
+    }
+    let first = values[0];
+    values.iter().all(|&x| (x - first).abs() < f64::EPSILON)
+}
+
+/// 对 values 两端做分位缩尾（winsorization）：落在 lower/upper 分位之外的值
+/// 截断到分位边界，用线性插值分位数计算边界。
+fn winsorize(values: &mut [f64], lower: f64, upper: f64) {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let lo = quantile(&sorted, lower);
+    let hi = quantile(&sorted, upper);
+    for v in values.iter_mut() {
+        if *v < lo {
+            *v = lo;
+        }
+        if *v > hi {
+            *v = hi;
+        }
+    }
+}
+
+fn quantile(sorted: &[f64], p: f64) -> f64 {
+    let n = sorted.len();
+    if n <= 1 {
+        return sorted[0];
+    }
+    let pos = p * (n as f64 - 1.0);
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+    let frac = pos - lo as f64;
+    sorted[lo] + (sorted[hi] - sorted[lo]) * frac
 }
 
 /// TCO 与 ROI 是后端经济模型的派生指标，不能信任前端提交的占位值。
@@ -259,7 +313,27 @@ mod tests {
             normalize(&[10.0, 20.0, 30.0], false),
             vec![100.0, 50.0, 0.0]
         );
-        assert_eq!(normalize(&[5.0, 5.0], true), vec![100.0, 100.0]);
+        // 等值（无区分度）与单方案统一给中性分，而不是满分。
+        assert_eq!(normalize(&[5.0, 5.0], true), vec![50.0, 50.0]);
+        assert_eq!(normalize(&[5.0, 5.0], false), vec![50.0, 50.0]);
+        assert_eq!(normalize(&[7.0], true), vec![50.0]);
+    }
+
+    #[test]
+    fn normalization_winsorizes_outliers_for_large_samples() {
+        let vals = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 1000.0];
+        let got = normalize(&vals, true);
+        // 极端值 1000 被缩尾截断；其余小值之间的分差得以保留、放大。
+        assert_eq!(got[9], 100.0);
+        assert!(got[8] > 1.0);
+        assert!(got[8] < 20.0);
+    }
+
+    #[test]
+    fn uniform_detection_covers_equal_and_single() {
+        assert!(is_uniform(&[4.0, 4.0, 4.0]));
+        assert!(!is_uniform(&[4.0, 5.0, 4.0]));
+        assert!(is_uniform(&[4.0]));
     }
     #[test]
     fn evm_reports_dual_risk() {

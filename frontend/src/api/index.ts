@@ -226,6 +226,10 @@ function decisionPayload(d: DecisionDraft) {
       weight_bps: Math.round(m.weight * 100),
       direction: m.direction,
       unit: m.unit,
+      threshold:
+        m.threshold === undefined || m.threshold === null
+          ? null
+          : Number(m.threshold),
     })),
     options: d.options.map((o) => ({
       name: o.name,
@@ -267,8 +271,13 @@ async function fullDecision(id: number): Promise<Decision> {
     (a: any, b: any) => a.rank - b.rank,
   )[0];
   if (top) {
-    d.recommendation = top.option_name;
-    d.recommendation_reason = `综合得分 ${Number(top.total_score).toFixed(1)}，TCO ¥${Number(top.tco).toLocaleString()}，ROI ${Number(top.roi).toFixed(2)}%。${top.advantages?.join("；") || ""}`;
+    if (top.feasible) {
+      d.recommendation = top.option_name;
+      d.recommendation_reason = `综合得分 ${Number(top.total_score).toFixed(1)}，TCO ¥${Number(top.tco).toLocaleString()}，ROI ${Number(top.roi).toFixed(2)}%。${top.advantages?.join("；") || ""}`;
+    } else {
+      d.recommendation = "无可行方案";
+      d.recommendation_reason = "所有候选方案均违反硬约束，请调整阈值或候选方案后重新评价。";
+    }
   }
   return d as Decision;
 }
@@ -284,6 +293,18 @@ export const decisionApi = {
   },
   evaluate: async (id: number) => {
     await post(`/decisions/${id}/evaluate`);
+    return fullDecision(id);
+  },
+  updateMetrics: async (id: number, metrics: DecisionMetric[]) => {
+    await put(`/decisions/${id}/metrics`, {
+      metrics: metrics.map((m) => ({
+        id: m.id,
+        weight_bps: Math.round(m.weight * 100),
+        direction: m.direction,
+        unit: m.unit,
+        threshold: m.threshold == null ? null : Number(m.threshold),
+      })),
+    });
     return fullDecision(id);
   },
   confirm: async (id: number, option_id: number, reason: string) => {

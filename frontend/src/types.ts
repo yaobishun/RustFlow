@@ -148,10 +148,13 @@ export interface DecisionOption {
   expected_benefit: number;
   values: Record<string, number>;
   scores?: Record<string, number>;
+  raw_values?: Record<string, number>;
   tco?: number;
   roi?: number;
   total_score?: number;
   rank?: number;
+  feasible?: boolean;
+  violations?: string[];
   advantages?: string[];
   disadvantages?: string[];
 }
@@ -162,6 +165,7 @@ export interface DecisionMetric {
   weight: number;
   direction: "higher" | "lower";
   unit: string;
+  threshold?: number;
 }
 export interface Decision {
   id: number;
