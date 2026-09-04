@@ -78,6 +78,29 @@ export interface MemberLoad {
   load_rate: number;
   active_tasks: number;
 }
+export interface AllocationAssignment {
+  task_id: number;
+  task_title: string;
+  from_user_id?: number;
+  to_user_id: number;
+  to_user_name: string;
+  score: number;
+  projected_peak_load: number;
+  reason: string;
+}
+export interface AllocationMemberImpact {
+  user_id: number;
+  user_name: string;
+  before_peak_load: number;
+  after_peak_load: number;
+}
+export interface AllocationPlan {
+  assignments: AllocationAssignment[];
+  member_impacts: AllocationMemberImpact[];
+  overload_before: number;
+  overload_after: number;
+  applied_count?: number;
+}
 export interface Worklog {
   id: number;
   task_id: number;

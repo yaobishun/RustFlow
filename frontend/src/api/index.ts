@@ -7,6 +7,7 @@ import type {
   DecisionMetric,
   DecisionOption,
   Expense,
+  AllocationPlan,
   MemberLoad,
   Milestone,
   Project,
@@ -117,6 +118,10 @@ export const projectApi = {
     ),
   addMember: (id: number, body: object) =>
     post(`/projects/${id}/members`, body),
+  allocationPreview: (id: number) =>
+    get<AllocationPlan>(`/projects/${id}/allocation/preview`),
+  allocationApply: (id: number) =>
+    post<AllocationPlan>(`/projects/${id}/allocation/apply`),
 };
 export const taskApi = {
   list: (project_id: number) => get<Task[]>(`/projects/${project_id}/tasks`),

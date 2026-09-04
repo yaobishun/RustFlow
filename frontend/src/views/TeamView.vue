@@ -7,7 +7,7 @@ import { peopleApi, projectApi } from "../api";
 import { errorMessage } from "../api/http";
 import { useProjectStore } from "../stores/projects";
 import { useAuthStore } from "../stores/auth";
-import type { MemberLoad, Team, User } from "../types";
+import type { AllocationPlan, MemberLoad, Team, User } from "../types";
 const projects = useProjectStore();
 const auth = useAuthStore();
 const canManage = computed(() =>
@@ -21,6 +21,15 @@ const loading = ref(true);
 const error = ref("");
 const tab = ref("load");
 const dialog = ref("");
+const dialogVisible = computed({
+  get: () => dialog.value !== "",
+  set: (visible: boolean) => {
+    if (!visible) dialog.value = "";
+  },
+});
+const allocationDialog = ref(false);
+const allocationPlan = ref<AllocationPlan>();
+const allocating = ref(false);
 const userForm = reactive({
   username: "",
   password: "",
@@ -86,6 +95,41 @@ async function save() {
     ElMessage.error(errorMessage(e));
   }
 }
+async function previewAllocation() {
+  if (!projects.selectedId) {
+    ElMessage.warning("请先选择项目");
+    return;
+  }
+  allocating.value = true;
+  try {
+    allocationPlan.value = await projectApi.allocationPreview(
+      projects.selectedId,
+    );
+    allocationDialog.value = true;
+  } catch (e) {
+    ElMessage.error(errorMessage(e));
+  } finally {
+    allocating.value = false;
+  }
+}
+async function applyAllocation() {
+  if (!projects.selectedId) return;
+  allocating.value = true;
+  try {
+    const result = await projectApi.allocationApply(projects.selectedId);
+    allocationDialog.value = false;
+    ElMessage.success(
+      `已智能分配 ${result.applied_count ?? result.assignments.length} 项任务`,
+    );
+    await load();
+  } catch (e) {
+    ElMessage.error(errorMessage(e));
+  } finally {
+    allocating.value = false;
+  }
+}
+const memberName = (id?: number) =>
+  id ? items.value.find((m) => m.id === id)?.name || `成员 #${id}` : "待分配";
 const avg = computed(() =>
   items.value.length
     ? items.value.reduce((s, x) => s + x.load_rate, 0) / items.value.length
@@ -111,6 +155,12 @@ onBeforeUnmount(() =>
     <PageHeader
       title="团队与成员"
       description="管理企业角色，并平衡成员可用工时与研发任务"
+      ><el-button
+        v-if="canManage && projects.selectedId"
+        type="primary"
+        :loading="allocating"
+        @click="previewAllocation"
+        >一键智能分配</el-button
       ><el-button v-if="canManage" @click="dialog = 'team'">创建团队</el-button
       ><el-button v-if="canManage" @click="dialog = 'member'"
         >添加团队成员</el-button
@@ -151,7 +201,7 @@ onBeforeUnmount(() =>
               ><el-table-column
                 label="活跃任务"
                 prop="active_tasks"
-              /><el-table-column label="已分配 / 可用工时" min-width="160"
+              /><el-table-column label="峰值周工时 / 周容量" min-width="170"
                 ><template #default="{ row }"
                   >{{ row.assigned_hours }}h /
                   {{ row.available_hours }}h</template
@@ -235,7 +285,7 @@ onBeforeUnmount(() =>
       </el-tabs></PageState
     >
     <el-dialog
-      v-model="dialog"
+      v-model="dialogVisible"
       :title="
         dialog === 'user'
           ? '创建用户'
@@ -323,5 +373,70 @@ onBeforeUnmount(() =>
         ><el-button type="primary" @click="save">保存</el-button></template
       ></el-dialog
     >
+    <el-dialog
+      v-model="allocationDialog"
+      title="智能负载分配预览"
+      width="min(900px,96vw)"
+    >
+      <el-alert
+        :type="allocationPlan?.overload_after ? 'warning' : 'success'"
+        :closable="false"
+        show-icon
+        :title="
+          allocationPlan?.assignments.length
+            ? `计划分配 ${allocationPlan.assignments.length} 项任务，过载成员 ${allocationPlan.overload_before} → ${allocationPlan.overload_after}`
+            : '当前任务分配已较合理，无需调整'
+        "
+      />
+      <h3 class="allocation-heading">任务分配方案</h3>
+      <el-table
+        :data="allocationPlan?.assignments || []"
+        empty-text="暂无待分配任务"
+      >
+        <el-table-column prop="task_title" label="任务" min-width="170" />
+        <el-table-column label="原负责人" min-width="110">
+          <template #default="{ row }">{{
+            memberName(row.from_user_id)
+          }}</template>
+        </el-table-column>
+        <el-table-column
+          prop="to_user_name"
+          label="建议负责人"
+          min-width="110"
+        />
+        <el-table-column label="峰值负载" width="100">
+          <template #default="{ row }"
+            >{{ row.projected_peak_load.toFixed(0) }}%</template
+          >
+        </el-table-column>
+        <el-table-column prop="reason" label="推荐理由" min-width="230" />
+      </el-table>
+      <h3 class="allocation-heading">成员负载变化</h3>
+      <el-table :data="allocationPlan?.member_impacts || []" size="small">
+        <el-table-column prop="user_name" label="成员" />
+        <el-table-column label="调整前峰值">
+          <template #default="{ row }"
+            >{{ row.before_peak_load.toFixed(0) }}%</template
+          >
+        </el-table-column>
+        <el-table-column label="调整后峰值">
+          <template #default="{ row }">
+            <span :class="{ danger: row.after_peak_load > 100 }"
+              >{{ row.after_peak_load.toFixed(0) }}%</span
+            >
+          </template>
+        </el-table-column>
+      </el-table>
+      <template #footer>
+        <el-button @click="allocationDialog = false">取消</el-button>
+        <el-button
+          type="primary"
+          :loading="allocating"
+          :disabled="!allocationPlan?.assignments.length"
+          @click="applyAllocation"
+          >确认应用方案</el-button
+        >
+      </template>
+    </el-dialog>
   </div>
 </template>

@@ -4,7 +4,7 @@ use axum::{
     http::{HeaderValue, Method, StatusCode},
     routing::{delete, get, post, put},
 };
-use chrono::{NaiveDate, Utc};
+use chrono::{Datelike, Duration, NaiveDate, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::{Row, SqlitePool};
@@ -49,6 +49,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/projects/{id}/tasks",
             get(list_tasks).post(create_task),
+        )
+        .route(
+            "/api/projects/{id}/allocation/preview",
+            get(allocation_preview),
+        )
+        .route(
+            "/api/projects/{id}/allocation/apply",
+            post(allocation_apply),
         )
         .route(
             "/api/projects/{id}/worklogs",
@@ -568,20 +576,162 @@ async fn project_members(
 ) -> ApiResult<Json<Value>> {
     require_project_member(&s.db, &actor, id).await?;
     let rows=sqlx::query("SELECT u.id,u.username,u.display_name,u.role,u.hourly_rate_cents,u.active,pm.project_role,(SELECT COALESCE(SUM(t.estimated_hours),0.0) FROM tasks t WHERE t.project_id=pm.project_id AND t.assignee_id=u.id AND t.status<>'done') assigned_hours,(SELECT COUNT(*) FROM tasks t WHERE t.project_id=pm.project_id AND t.assignee_id=u.id AND t.status NOT IN ('todo','done')) active_tasks,COALESCE(tm.weekly_capacity_hours,40.0) capacity FROM project_members pm JOIN users u ON u.id=pm.user_id JOIN projects p ON p.id=pm.project_id LEFT JOIN team_members tm ON tm.team_id=p.team_id AND tm.user_id=u.id WHERE pm.project_id=?").bind(id).fetch_all(&s.db).await?;
+    let peak_loads = if rows.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        build_allocation_plan(&s.db, id)
+            .await?
+            .member_impacts
+            .into_iter()
+            .map(|impact| (impact.user_id, impact.before_peak_load))
+            .collect::<std::collections::HashMap<_, _>>()
+    };
     Ok(Json(Value::Array(
         rows.iter()
             .map(|r| {
-                let assigned: f64 = r.get("assigned_hours");
                 let capacity: f64 = r.get("capacity");
+                let user_id: i64 = r.get("id");
+                let load_rate = peak_loads.get(&user_id).copied().unwrap_or(0.0);
+                let assigned = capacity * load_rate / 100.0;
                 let mut v = user_json(r);
                 v["project_role"] = json!(r.get::<String, _>("project_role"));
                 v["assigned_hours"] = json!(assigned);
                 v["active_tasks"] = json!(r.get::<i64, _>("active_tasks"));
-                v["load_rate"] = json!(assigned / capacity * 100.0);
+                v["load_rate"] = json!(load_rate);
                 v
             })
             .collect(),
     )))
+}
+
+fn allocation_week(date: NaiveDate, horizon_start: NaiveDate, weeks: usize) -> usize {
+    if date <= horizon_start {
+        0
+    } else {
+        ((date - horizon_start).num_days() / 7) as usize
+    }
+    .min(weeks.saturating_sub(1))
+}
+
+async fn build_allocation_plan(
+    db: &SqlitePool,
+    project_id: i64,
+) -> ApiResult<services::AllocationPlan> {
+    let member_rows = sqlx::query(
+        "SELECT u.id,u.display_name,pm.project_role,u.hourly_rate_cents,COALESCE(tm.weekly_capacity_hours,40.0) capacity FROM project_members pm JOIN users u ON u.id=pm.user_id JOIN projects p ON p.id=pm.project_id LEFT JOIN team_members tm ON tm.team_id=p.team_id AND tm.user_id=u.id WHERE pm.project_id=? AND u.active=1 ORDER BY u.id",
+    )
+    .bind(project_id)
+    .fetch_all(db)
+    .await?;
+    if member_rows.is_empty() {
+        return Err(ApiError::BadRequest(
+            "当前项目没有可参与分配的有效成员".into(),
+        ));
+    }
+    let members = member_rows
+        .iter()
+        .map(|r| services::AllocationMember {
+            id: r.get("id"),
+            name: r.get("display_name"),
+            role: r.get("project_role"),
+            weekly_capacity: r.get::<f64, _>("capacity").max(0.1),
+            hourly_rate: cents_to_yuan(r.get("hourly_rate_cents")),
+        })
+        .collect::<Vec<_>>();
+    let member_ids = members
+        .iter()
+        .map(|m| m.id)
+        .collect::<std::collections::HashSet<_>>();
+    let task_rows = sqlx::query(
+        "SELECT t.id,t.project_id,t.title,t.priority,t.status,t.assignee_id,t.estimated_hours,t.progress,t.planned_start,t.planned_end,(SELECT COUNT(*) FROM task_dependencies d WHERE d.depends_on_task_id=t.id) downstream_count FROM tasks t JOIN projects p ON p.id=t.project_id WHERE p.status<>'archived' AND t.status<>'done' ORDER BY t.id",
+    )
+    .fetch_all(db)
+    .await?;
+    let today = Utc::now().date_naive();
+    let horizon_start = today - Duration::days(today.weekday().num_days_from_monday() as i64);
+    let latest_end = task_rows
+        .iter()
+        .filter_map(|r| {
+            NaiveDate::parse_from_str(r.get::<String, _>("planned_end").as_str(), "%Y-%m-%d").ok()
+        })
+        .max()
+        .unwrap_or(today);
+    let weeks = (((latest_end - horizon_start).num_days().max(0) / 7) + 1).clamp(1, 26) as usize;
+    let mut locked = Vec::new();
+    let mut targets = Vec::new();
+    for r in task_rows {
+        let pid: i64 = r.get("project_id");
+        let status: String = r.get("status");
+        let assignee_id: Option<i64> = r.get("assignee_id");
+        let is_target = pid == project_id && (status == "todo" || assignee_id.is_none());
+        if !is_target && assignee_id.is_none_or(|id| !member_ids.contains(&id)) {
+            continue;
+        }
+        let start = valid_date(&r.get::<String, _>("planned_start"))?;
+        let end = valid_date(&r.get::<String, _>("planned_end"))?;
+        let progress = r.get::<i64, _>("progress").clamp(0, 100) as f64;
+        let task = services::AllocationTask {
+            id: r.get("id"),
+            title: r.get("title"),
+            priority: r.get("priority"),
+            assignee_id,
+            remaining_hours: (r.get::<f64, _>("estimated_hours") * (1.0 - progress / 100.0))
+                .max(0.0),
+            start_week: allocation_week(start.max(today), horizon_start, weeks),
+            end_week: allocation_week(end.max(today), horizon_start, weeks),
+            downstream_count: r.get::<i64, _>("downstream_count") as usize,
+        };
+        if is_target {
+            targets.push(task);
+        } else {
+            locked.push(task);
+        }
+    }
+    Ok(services::allocate_workload(
+        &members, &locked, &targets, weeks,
+    ))
+}
+
+async fn allocation_preview(
+    State(s): State<AppState>,
+    actor: Actor,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<services::AllocationPlan>> {
+    require_project_manager(&s.db, &actor, id).await?;
+    Ok(Json(build_allocation_plan(&s.db, id).await?))
+}
+
+async fn allocation_apply(
+    State(s): State<AppState>,
+    actor: Actor,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<Value>> {
+    require_project_manager(&s.db, &actor, id).await?;
+    let plan = build_allocation_plan(&s.db, id).await?;
+    let mut tx = s.db.begin().await?;
+    let mut applied = 0_u64;
+    for assignment in &plan.assignments {
+        let result = sqlx::query("UPDATE tasks SET assignee_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=? AND (status='todo' OR assignee_id IS NULL)")
+            .bind(assignment.to_user_id)
+            .bind(assignment.task_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        applied += result.rows_affected();
+    }
+    tx.commit().await?;
+    log(
+        &s.db,
+        actor.id,
+        "project",
+        Some(id),
+        "smart_allocate",
+        &format!("应用{applied}项任务分配"),
+    )
+    .await;
+    let mut value = serde_json::to_value(plan).map_err(|_| ApiError::Internal)?;
+    value["applied_count"] = json!(applied);
+    Ok(Json(value))
 }
 async fn add_project_member(
     State(s): State<AppState>,
@@ -1845,8 +1995,9 @@ async fn dashboard(
     let evm = evm_for(&s.db, pid).await?;
     let risks = risk_values(&s.db, pid).await?;
     let milestones=sqlx::query("SELECT id,name,end_date due_date,status FROM milestones WHERE project_id=? AND status<>'completed' ORDER BY end_date LIMIT 5").bind(pid).fetch_all(&s.db).await?;
-    let member_rows=sqlx::query("SELECT u.id,u.display_name name,pm.project_role role,u.hourly_rate_cents,COALESCE(tm.weekly_capacity_hours,40.0) capacity,COALESCE(SUM(t.estimated_hours),0.0) assigned_hours,COUNT(t.id) active_tasks FROM project_members pm JOIN users u ON u.id=pm.user_id JOIN projects p ON p.id=pm.project_id LEFT JOIN team_members tm ON tm.team_id=p.team_id AND tm.user_id=u.id LEFT JOIN tasks t ON t.project_id=pm.project_id AND t.assignee_id=u.id AND t.status<>'done' WHERE pm.project_id=? GROUP BY u.id,u.display_name,pm.project_role,u.hourly_rate_cents,tm.weekly_capacity_hours ORDER BY assigned_hours DESC").bind(pid).fetch_all(&s.db).await?;
-    let member_loads=member_rows.iter().map(|r|{let assigned:f64=r.get("assigned_hours");let capacity:f64=r.get("capacity");json!({"id":r.get::<i64,_>("id"),"name":r.get::<String,_>("name"),"role":r.get::<String,_>("role"),"hourly_rate":cents_to_yuan(r.get("hourly_rate_cents")),"assigned_hours":assigned,"available_hours":capacity,"capacity":capacity,"load_rate":if capacity>0.0{assigned/capacity*100.0}else{0.0},"active_tasks":r.get::<i64,_>("active_tasks")})}).collect::<Vec<_>>();
+    let member_rows=sqlx::query("SELECT u.id,u.display_name name,pm.project_role role,u.hourly_rate_cents,COALESCE(tm.weekly_capacity_hours,40.0) capacity,COUNT(t.id) active_tasks FROM project_members pm JOIN users u ON u.id=pm.user_id JOIN projects p ON p.id=pm.project_id LEFT JOIN team_members tm ON tm.team_id=p.team_id AND tm.user_id=u.id LEFT JOIN tasks t ON t.project_id=pm.project_id AND t.assignee_id=u.id AND t.status<>'done' WHERE pm.project_id=? GROUP BY u.id,u.display_name,pm.project_role,u.hourly_rate_cents,tm.weekly_capacity_hours ORDER BY u.id").bind(pid).fetch_all(&s.db).await?;
+    let dashboard_peak_loads = build_allocation_plan(&s.db, pid).await.ok().map(|plan| plan.member_impacts.into_iter().map(|impact|(impact.user_id,impact.before_peak_load)).collect::<std::collections::HashMap<_,_>>()).unwrap_or_default();
+    let member_loads=member_rows.iter().map(|r|{let capacity:f64=r.get("capacity");let load_rate=dashboard_peak_loads.get(&r.get::<i64,_>("id")).copied().unwrap_or(0.0);json!({"id":r.get::<i64,_>("id"),"name":r.get::<String,_>("name"),"role":r.get::<String,_>("role"),"hourly_rate":cents_to_yuan(r.get("hourly_rate_cents")),"assigned_hours":capacity*load_rate/100.0,"available_hours":capacity,"capacity":capacity,"load_rate":load_rate,"active_tasks":r.get::<i64,_>("active_tasks")})}).collect::<Vec<_>>();
     let trend_rows=sqlx::query("SELECT cost_date,SUM(value_cents) value_cents FROM (SELECT w.work_date cost_date,w.hours*u.hourly_rate_cents value_cents FROM worklogs w JOIN tasks t ON t.id=w.task_id JOIN users u ON u.id=w.user_id WHERE t.project_id=? UNION ALL SELECT occurred_on cost_date,CAST(amount_cents AS REAL) value_cents FROM expenses WHERE project_id=?) GROUP BY cost_date ORDER BY cost_date").bind(pid).bind(pid).fetch_all(&s.db).await?;
     let mut cumulative_cents = 0.0;
     let mut cost_trend = Vec::new();
@@ -2084,6 +2235,59 @@ mod tests {
         assert_eq!(archived.status(), StatusCode::OK);
         let write=authed(&app,"POST","/api/projects/1/milestones",&manager,json!({"name":"不应创建","description":"","start_date":"2026-10-01","end_date":"2026-10-02"})).await;
         assert_eq!(write.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn manager_can_preview_and_apply_smart_allocation() {
+        let app = seeded_app().await;
+        let manager = login_as(&app, "manager").await;
+        let created = authed(
+            &app,
+            "POST",
+            "/api/projects/1/tasks",
+            &manager,
+            json!({"milestone_id":3,"title":"新增测试任务","description":"","acceptance_criteria":"","assignee_id":null,"participant_ids":[],"priority":"high","planned_start":"2026-10-01","planned_end":"2026-10-05","estimated_hours":16}),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created_id = serde_json::from_slice::<Value>(
+            &created.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        let preview = authed(
+            &app,
+            "GET",
+            "/api/projects/1/allocation/preview",
+            &manager,
+            json!({}),
+        )
+        .await;
+        assert_eq!(preview.status(), StatusCode::OK);
+        let plan: Value =
+            serde_json::from_slice(&preview.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert!(!plan["assignments"].as_array().unwrap().is_empty());
+        assert!(plan["assignments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|assignment| assignment["task_id"] == created_id));
+
+        let applied = authed(
+            &app,
+            "POST",
+            "/api/projects/1/allocation/apply",
+            &manager,
+            json!({}),
+        )
+        .await;
+        assert_eq!(applied.status(), StatusCode::OK);
+        let result: Value =
+            serde_json::from_slice(&applied.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(result["applied_count"], 1);
     }
 
     #[tokio::test]

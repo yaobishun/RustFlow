@@ -37,6 +37,12 @@ const loading = ref(true);
 const error = ref("");
 const tab = ref("worklog");
 const dialog = ref<"work" | "expense" | "">("");
+const dialogVisible = computed({
+  get: () => dialog.value !== "",
+  set: (visible: boolean) => {
+    if (!visible) dialog.value = "";
+  },
+});
 const work = reactive({
   task_id: undefined as number | undefined,
   work_date: "",
@@ -271,7 +277,7 @@ onBeforeUnmount(() =>
       </template></PageState
     >
     <el-dialog
-      v-model="dialog"
+      v-model="dialogVisible"
       :title="dialog === 'work' ? '填写工时' : '记录项目支出'"
       width="min(520px,92vw)"
       ><el-form v-if="dialog === 'work'" label-position="top"
