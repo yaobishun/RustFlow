@@ -4,7 +4,7 @@ use axum::{
     http::{HeaderValue, Method, StatusCode},
     routing::{delete, get, post, put},
 };
-use chrono::{NaiveDate, Utc};
+use chrono::{Datelike, Duration, NaiveDate, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::{Row, SqlitePool};
@@ -51,6 +51,14 @@ pub fn router(state: AppState) -> Router {
             get(list_tasks).post(create_task),
         )
         .route(
+            "/api/projects/{id}/allocation/preview",
+            get(allocation_preview),
+        )
+        .route(
+            "/api/projects/{id}/allocation/apply",
+            post(allocation_apply),
+        )
+        .route(
             "/api/projects/{id}/worklogs",
             get(project_worklogs).post(create_worklog_for_project),
         )
@@ -92,6 +100,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/decisions/{id}", get(get_decision))
         .route("/api/decisions/{id}/evaluate", post(evaluate_decision))
         .route("/api/decisions/{id}/confirm", post(confirm_decision))
+        .route("/api/decisions/{id}/metrics", put(update_decision_metrics))
         .route("/api/dashboard", get(dashboard))
         .route("/api/activity-logs", get(activity_logs))
         .with_state(state)
@@ -567,20 +576,162 @@ async fn project_members(
 ) -> ApiResult<Json<Value>> {
     require_project_member(&s.db, &actor, id).await?;
     let rows=sqlx::query("SELECT u.id,u.username,u.display_name,u.role,u.hourly_rate_cents,u.active,pm.project_role,(SELECT COALESCE(SUM(t.estimated_hours),0.0) FROM tasks t WHERE t.project_id=pm.project_id AND t.assignee_id=u.id AND t.status<>'done') assigned_hours,(SELECT COUNT(*) FROM tasks t WHERE t.project_id=pm.project_id AND t.assignee_id=u.id AND t.status NOT IN ('todo','done')) active_tasks,COALESCE(tm.weekly_capacity_hours,40.0) capacity FROM project_members pm JOIN users u ON u.id=pm.user_id JOIN projects p ON p.id=pm.project_id LEFT JOIN team_members tm ON tm.team_id=p.team_id AND tm.user_id=u.id WHERE pm.project_id=?").bind(id).fetch_all(&s.db).await?;
+    let peak_loads = if rows.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        build_allocation_plan(&s.db, id)
+            .await?
+            .member_impacts
+            .into_iter()
+            .map(|impact| (impact.user_id, impact.before_peak_load))
+            .collect::<std::collections::HashMap<_, _>>()
+    };
     Ok(Json(Value::Array(
         rows.iter()
             .map(|r| {
-                let assigned: f64 = r.get("assigned_hours");
                 let capacity: f64 = r.get("capacity");
+                let user_id: i64 = r.get("id");
+                let load_rate = peak_loads.get(&user_id).copied().unwrap_or(0.0);
+                let assigned = capacity * load_rate / 100.0;
                 let mut v = user_json(r);
                 v["project_role"] = json!(r.get::<String, _>("project_role"));
                 v["assigned_hours"] = json!(assigned);
                 v["active_tasks"] = json!(r.get::<i64, _>("active_tasks"));
-                v["load_rate"] = json!(assigned / capacity * 100.0);
+                v["load_rate"] = json!(load_rate);
                 v
             })
             .collect(),
     )))
+}
+
+fn allocation_week(date: NaiveDate, horizon_start: NaiveDate, weeks: usize) -> usize {
+    if date <= horizon_start {
+        0
+    } else {
+        ((date - horizon_start).num_days() / 7) as usize
+    }
+    .min(weeks.saturating_sub(1))
+}
+
+async fn build_allocation_plan(
+    db: &SqlitePool,
+    project_id: i64,
+) -> ApiResult<services::AllocationPlan> {
+    let member_rows = sqlx::query(
+        "SELECT u.id,u.display_name,pm.project_role,u.hourly_rate_cents,COALESCE(tm.weekly_capacity_hours,40.0) capacity FROM project_members pm JOIN users u ON u.id=pm.user_id JOIN projects p ON p.id=pm.project_id LEFT JOIN team_members tm ON tm.team_id=p.team_id AND tm.user_id=u.id WHERE pm.project_id=? AND u.active=1 ORDER BY u.id",
+    )
+    .bind(project_id)
+    .fetch_all(db)
+    .await?;
+    if member_rows.is_empty() {
+        return Err(ApiError::BadRequest(
+            "当前项目没有可参与分配的有效成员".into(),
+        ));
+    }
+    let members = member_rows
+        .iter()
+        .map(|r| services::AllocationMember {
+            id: r.get("id"),
+            name: r.get("display_name"),
+            role: r.get("project_role"),
+            weekly_capacity: r.get::<f64, _>("capacity").max(0.1),
+            hourly_rate: cents_to_yuan(r.get("hourly_rate_cents")),
+        })
+        .collect::<Vec<_>>();
+    let member_ids = members
+        .iter()
+        .map(|m| m.id)
+        .collect::<std::collections::HashSet<_>>();
+    let task_rows = sqlx::query(
+        "SELECT t.id,t.project_id,t.title,t.priority,t.status,t.assignee_id,t.estimated_hours,t.progress,t.planned_start,t.planned_end,(SELECT COUNT(*) FROM task_dependencies d WHERE d.depends_on_task_id=t.id) downstream_count FROM tasks t JOIN projects p ON p.id=t.project_id WHERE p.status<>'archived' AND t.status<>'done' ORDER BY t.id",
+    )
+    .fetch_all(db)
+    .await?;
+    let today = Utc::now().date_naive();
+    let horizon_start = today - Duration::days(today.weekday().num_days_from_monday() as i64);
+    let latest_end = task_rows
+        .iter()
+        .filter_map(|r| {
+            NaiveDate::parse_from_str(r.get::<String, _>("planned_end").as_str(), "%Y-%m-%d").ok()
+        })
+        .max()
+        .unwrap_or(today);
+    let weeks = (((latest_end - horizon_start).num_days().max(0) / 7) + 1).clamp(1, 26) as usize;
+    let mut locked = Vec::new();
+    let mut targets = Vec::new();
+    for r in task_rows {
+        let pid: i64 = r.get("project_id");
+        let status: String = r.get("status");
+        let assignee_id: Option<i64> = r.get("assignee_id");
+        let is_target = pid == project_id && (status == "todo" || assignee_id.is_none());
+        if !is_target && assignee_id.is_none_or(|id| !member_ids.contains(&id)) {
+            continue;
+        }
+        let start = valid_date(&r.get::<String, _>("planned_start"))?;
+        let end = valid_date(&r.get::<String, _>("planned_end"))?;
+        let progress = r.get::<i64, _>("progress").clamp(0, 100) as f64;
+        let task = services::AllocationTask {
+            id: r.get("id"),
+            title: r.get("title"),
+            priority: r.get("priority"),
+            assignee_id,
+            remaining_hours: (r.get::<f64, _>("estimated_hours") * (1.0 - progress / 100.0))
+                .max(0.0),
+            start_week: allocation_week(start.max(today), horizon_start, weeks),
+            end_week: allocation_week(end.max(today), horizon_start, weeks),
+            downstream_count: r.get::<i64, _>("downstream_count") as usize,
+        };
+        if is_target {
+            targets.push(task);
+        } else {
+            locked.push(task);
+        }
+    }
+    Ok(services::allocate_workload(
+        &members, &locked, &targets, weeks,
+    ))
+}
+
+async fn allocation_preview(
+    State(s): State<AppState>,
+    actor: Actor,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<services::AllocationPlan>> {
+    require_project_manager(&s.db, &actor, id).await?;
+    Ok(Json(build_allocation_plan(&s.db, id).await?))
+}
+
+async fn allocation_apply(
+    State(s): State<AppState>,
+    actor: Actor,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<Value>> {
+    require_project_manager(&s.db, &actor, id).await?;
+    let plan = build_allocation_plan(&s.db, id).await?;
+    let mut tx = s.db.begin().await?;
+    let mut applied = 0_u64;
+    for assignment in &plan.assignments {
+        let result = sqlx::query("UPDATE tasks SET assignee_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=? AND (status='todo' OR assignee_id IS NULL)")
+            .bind(assignment.to_user_id)
+            .bind(assignment.task_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        applied += result.rows_affected();
+    }
+    tx.commit().await?;
+    log(
+        &s.db,
+        actor.id,
+        "project",
+        Some(id),
+        "smart_allocate",
+        &format!("应用{applied}项任务分配"),
+    )
+    .await;
+    let mut value = serde_json::to_value(plan).map_err(|_| ApiError::Internal)?;
+    value["applied_count"] = json!(applied);
+    Ok(Json(value))
 }
 async fn add_project_member(
     State(s): State<AppState>,
@@ -1464,7 +1615,7 @@ async fn create_decision(
         if !["higher", "lower"].contains(&m.direction.as_str()) {
             return Err(ApiError::BadRequest("指标方向必须为higher或lower".into()));
         }
-        let id=sqlx::query("INSERT INTO decision_metrics(decision_id,name,weight_bps,direction,unit) VALUES(?,?,?,?,?)").bind(d).bind(m.name).bind(m.weight_bps).bind(m.direction).bind(m.unit).execute(&mut *tx).await?.last_insert_rowid();
+        let id=sqlx::query("INSERT INTO decision_metrics(decision_id,name,weight_bps,direction,unit,threshold) VALUES(?,?,?,?,?,?)").bind(d).bind(m.name).bind(m.weight_bps).bind(m.direction).bind(m.unit).bind(m.threshold).execute(&mut *tx).await?.last_insert_rowid();
         mids.push(id);
     }
     for o in req.options {
@@ -1494,7 +1645,7 @@ async fn get_decision(
         .bind(id)
         .fetch_all(&s.db)
         .await?;
-    v["metrics"]=Value::Array(metrics.iter().map(|r|{let name:String=r.get("name");let key=metric_key(&name);json!({"id":r.get::<i64,_>("id"),"name":name,"key":key,"weight_bps":r.get::<i64,_>("weight_bps"),"weight":r.get::<i64,_>("weight_bps") as f64/100.0,"direction":r.get::<String,_>("direction"),"unit":r.get::<String,_>("unit")})}).collect());
+    v["metrics"]=Value::Array(metrics.iter().map(|r|{let name:String=r.get("name");let key=metric_key(&name);json!({"id":r.get::<i64,_>("id"),"name":name,"key":key,"weight_bps":r.get::<i64,_>("weight_bps"),"weight":r.get::<i64,_>("weight_bps") as f64/100.0,"direction":r.get::<String,_>("direction"),"unit":r.get::<String,_>("unit"),"threshold":r.get::<Option<f64>,_>("threshold")})}).collect());
     let options = sqlx::query("SELECT * FROM decision_options WHERE decision_id=? ORDER BY id")
         .bind(id)
         .fetch_all(&s.db)
@@ -1512,7 +1663,7 @@ async fn get_decision(
     }
     v["options"] = Value::Array(option_values);
     let results=sqlx::query("SELECT r.*,o.name FROM decision_results r JOIN decision_options o ON o.id=r.option_id WHERE r.decision_id=? ORDER BY rank").bind(id).fetch_all(&s.db).await?;
-    v["results"]=Value::Array(results.iter().map(|r|json!({"option_id":r.get::<i64,_>("option_id"),"option_name":r.get::<String,_>("name"),"tco":cents_to_yuan(r.get("tco_cents")),"roi":r.get::<i64,_>("roi_bps") as f64/100.0,"total_score":r.get::<f64,_>("total_score"),"rank":r.get::<i64,_>("rank"),"scores":serde_json::from_str::<Value>(r.get("scores_json")).unwrap_or(json!({})),"advantages":serde_json::from_str::<Value>(r.get("advantages_json")).unwrap_or(json!([])),"disadvantages":serde_json::from_str::<Value>(r.get("disadvantages_json")).unwrap_or(json!([]))})).collect());
+    v["results"]=Value::Array(results.iter().map(|r|json!({"option_id":r.get::<i64,_>("option_id"),"option_name":r.get::<String,_>("name"),"tco":cents_to_yuan(r.get("tco_cents")),"roi":r.get::<i64,_>("roi_bps") as f64/100.0,"total_score":r.get::<f64,_>("total_score"),"rank":r.get::<i64,_>("rank"),"feasible":r.get::<i64,_>("feasible") != 0,"violations":serde_json::from_str::<Value>(r.get("violations_json")).unwrap_or(json!([])),"scores":serde_json::from_str::<Value>(r.get("scores_json")).unwrap_or(json!({})),"advantages":serde_json::from_str::<Value>(r.get("advantages_json")).unwrap_or(json!([])),"disadvantages":serde_json::from_str::<Value>(r.get("disadvantages_json")).unwrap_or(json!([]))})).collect());
     Ok(Json(v))
 }
 
@@ -1522,6 +1673,20 @@ struct EvalOption {
     name: String,
     tco: i64,
     roi: i64,
+}
+
+/// 标准分低于该阈值才被报告为"相对较弱"的短板。
+const DISADVANTAGE_THRESHOLD: f64 = 60.0;
+
+/// 单个方案在单个指标上的一次贡献，用于后续生成优劣点文案。
+#[derive(Clone, Debug)]
+struct MetricContribution {
+    key: String,
+    metric: String,
+    raw: f64,
+    normalized: f64,
+    weight: f64,
+    uniform: bool,
 }
 async fn evaluate_decision(
     State(s): State<AppState>,
@@ -1561,13 +1726,15 @@ async fn evaluate_decision(
         });
     }
     let mrows = sqlx::query(
-        "SELECT id,name,weight_bps,direction FROM decision_metrics WHERE decision_id=? ORDER BY id",
+        "SELECT id,name,weight_bps,direction,threshold FROM decision_metrics WHERE decision_id=? ORDER BY id",
     )
     .bind(id)
     .fetch_all(&s.db)
     .await?;
     let mut scores = vec![0.0; opts.len()];
-    let mut contributions = vec![Vec::<(String, String, f64, f64)>::new(); opts.len()];
+    let mut contributions = vec![Vec::<MetricContribution>::new(); opts.len()];
+    let mut feasible = vec![true; opts.len()];
+    let mut violations = vec![Vec::<String>::new(); opts.len()];
     for m in &mrows {
         let mid: i64 = m.get("id");
         let metric_name: String = m.get("name");
@@ -1594,17 +1761,43 @@ async fn evaluate_decision(
                 o.roi,
             ));
         }
-        let normalized = services::normalize(&raw, m.get::<String, _>("direction") == "higher");
+        // 硬约束：higher 指标要求值 >= 阈值，lower 指标要求值 <= 阈值。
+        // 用解析后的值（TCO 为元、ROI 为百分数、其余为原始值）与阈值比较。
+        let higher = m.get::<String, _>("direction") == "higher";
+        if let Some(t) = m.get::<Option<f64>, _>("threshold") {
+            for i in 0..opts.len() {
+                let violated = if higher { raw[i] < t } else { raw[i] > t };
+                if violated {
+                    feasible[i] = false;
+                    violations[i].push(metric_name.clone());
+                }
+            }
+        }
+        let normalized = services::normalize(&raw, higher);
         let weight = m.get::<i64, _>("weight_bps") as f64 / 10000.0;
         let key = metric_key(&metric_name);
+        // 无区分度的指标（各方案值相同）不参与优劣点判定，避免把中性分误报成亮点/短板。
+        let uniform = services::is_uniform(&raw);
         for i in 0..opts.len() {
             let c = normalized[i] * weight;
             scores[i] += c;
-            contributions[i].push((key.clone(), metric_name.clone(), normalized[i], c));
+            contributions[i].push(MetricContribution {
+                key: key.clone(),
+                metric: metric_name.clone(),
+                raw: raw[i],
+                normalized: normalized[i],
+                weight,
+                uniform,
+            });
         }
     }
+    // 可行方案按分数降序排在最前；不可行方案仍保留（供对比），排在可行方案之后。
     let mut order: Vec<usize> = (0..opts.len()).collect();
-    order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
+    order.sort_by(|&a, &b| {
+        feasible[b]
+            .cmp(&feasible[a])
+            .then(scores[b].total_cmp(&scores[a]))
+    });
     let mut result_json = Vec::new();
     let mut tx = s.db.begin().await?;
     sqlx::query("DELETE FROM decision_results WHERE decision_id=?")
@@ -1612,49 +1805,79 @@ async fn evaluate_decision(
         .execute(&mut *tx)
         .await?;
     for (rank, &i) in order.iter().enumerate() {
-        let mut c = contributions[i].clone();
+        let c = contributions[i].clone();
         let score_map: BTreeMap<String, f64> = c
             .iter()
-            .map(|(key, _, normalized, _)| (key.clone(), *normalized))
+            .map(|x| (x.key.clone(), x.normalized))
             .collect();
-        c.sort_by(|a, b| b.3.total_cmp(&a.3));
-        let advantages = c
+        let raw_map: BTreeMap<String, f64> = c
+            .iter()
+            .map(|x| (x.key.clone(), x.raw))
+            .collect();
+
+        // 亮点：在有区分度的指标里，按加权贡献（标准分×权重）降序取前 2。
+        let mut ranked = c
+            .iter()
+            .filter(|x| !x.uniform)
+            .map(|x| (x, x.normalized * x.weight))
+            .collect::<Vec<_>>();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let advantages = ranked
             .iter()
             .take(2)
-            .map(|(_, n, v, _)| format!("{n}表现突出（标准分{v:.1}）"))
+            .map(|(x, _)| format!("{}表现突出（标准分{:.1}）", x.metric, x.normalized))
             .collect::<Vec<_>>();
-        c.sort_by(|a, b| a.2.total_cmp(&b.2));
-        let disadvantages = c
+
+        // 短板：优先报权重高且标准分低（且低于阈值）的指标。
+        let mut weak = c
+            .iter()
+            .filter(|x| !x.uniform && x.normalized < DISADVANTAGE_THRESHOLD)
+            .collect::<Vec<_>>();
+        weak.sort_by(|a, b| {
+            b.weight
+                .total_cmp(&a.weight)
+                .then(a.normalized.total_cmp(&b.normalized))
+        });
+        let disadvantages = weak
             .iter()
             .take(1)
-            .filter(|(_, _, v, _)| *v < 60.0)
-            .map(|(_, n, v, _)| format!("{n}相对较弱（标准分{v:.1}）"))
+            .map(|x| format!("{}相对较弱（标准分{:.1}）", x.metric, x.normalized))
             .collect::<Vec<_>>();
-        sqlx::query("INSERT INTO decision_results(decision_id,option_id,tco_cents,roi_bps,total_score,rank,scores_json,advantages_json,disadvantages_json) VALUES(?,?,?,?,?,?,?,?,?)").bind(id).bind(opts[i].id).bind(opts[i].tco).bind(opts[i].roi).bind(scores[i]).bind(rank as i64+1).bind(serde_json::to_string(&score_map).unwrap()).bind(serde_json::to_string(&advantages).unwrap()).bind(serde_json::to_string(&disadvantages).unwrap()).execute(&mut *tx).await?;
-        result_json.push(json!({"option_id":opts[i].id,"option_name":opts[i].name,"tco":cents_to_yuan(opts[i].tco),"roi":opts[i].roi as f64/100.0,"total_score":scores[i],"rank":rank+1,"scores":score_map,"advantages":advantages,"disadvantages":disadvantages}));
+
+        let violations_json = serde_json::to_string(&violations[i]).unwrap();
+        sqlx::query("INSERT INTO decision_results(decision_id,option_id,tco_cents,roi_bps,total_score,rank,scores_json,advantages_json,disadvantages_json,feasible,violations_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)").bind(id).bind(opts[i].id).bind(opts[i].tco).bind(opts[i].roi).bind(scores[i]).bind(rank as i64+1).bind(serde_json::to_string(&score_map).unwrap()).bind(serde_json::to_string(&advantages).unwrap()).bind(serde_json::to_string(&disadvantages).unwrap()).bind(feasible[i]).bind(&violations_json).execute(&mut *tx).await?;
+        result_json.push(json!({"option_id":opts[i].id,"option_name":opts[i].name,"tco":cents_to_yuan(opts[i].tco),"roi":opts[i].roi as f64/100.0,"total_score":scores[i],"rank":rank+1,"feasible":feasible[i],"violations":violations[i],"scores":score_map,"raw_values":raw_map,"advantages":advantages,"disadvantages":disadvantages}));
     }
     sqlx::query("UPDATE decisions SET status='evaluated' WHERE id=?")
         .bind(id)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    let top = &result_json[0];
-    let reason = format!(
-        "推荐{}：综合得分{:.1}，排名第一；TCO为{:.2}元，ROI为{:.2}% {}",
-        top["option_name"].as_str().unwrap_or("该方案"),
-        top["total_score"].as_f64().unwrap_or(0.0),
-        top["tco"].as_f64().unwrap_or(0.0),
-        top["roi"].as_f64().unwrap_or(0.0),
-        top["advantages"]
-            .as_array()
-            .and_then(|a| a.first())
-            .and_then(Value::as_str)
-            .unwrap_or("")
-    );
+    let top = result_json
+        .iter()
+        .find(|r| r["feasible"].as_bool().unwrap_or(false))
+        .or_else(|| result_json.first());
+    let reason = match top {
+        Some(t) if t["feasible"].as_bool().unwrap_or(false) => format!(
+            "推荐{}：综合得分{:.1}，排名第一；TCO为{:.2}元，ROI为{:.2}% {}",
+            t["option_name"].as_str().unwrap_or("该方案"),
+            t["total_score"].as_f64().unwrap_or(0.0),
+            t["tco"].as_f64().unwrap_or(0.0),
+            t["roi"].as_f64().unwrap_or(0.0),
+            t["advantages"]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        ),
+        _ => format!("无可行方案：全部{count}个候选方案均违反硬约束", count = opts.len()),
+    };
     log(&s.db, actor.id, "decision", Some(id), "evaluate", &reason).await;
-    Ok(Json(
-        json!({"recommended_option_id":top["option_id"],"recommendation":reason,"results":result_json}),
-    ))
+    Ok(Json(json!({
+        "recommended_option_id": top.and_then(|t| t["feasible"].as_bool().unwrap_or(false).then(|| t["option_id"].clone())),
+        "recommendation": reason,
+        "results": result_json,
+    })))
 }
 async fn confirm_decision(
     State(s): State<AppState>,
@@ -1696,6 +1919,52 @@ async fn confirm_decision(
     .await;
     Ok(Json(json!({"ok":true,"confirmed_option_id":req.option_id})))
 }
+async fn update_decision_metrics(
+    State(s): State<AppState>,
+    actor: Actor,
+    Path(id): Path<i64>,
+    Json(req): Json<UpdateDecisionMetrics>,
+) -> ApiResult<Json<Value>> {
+    let decision = sqlx::query("SELECT status,project_id FROM decisions WHERE id=?")
+        .bind(id)
+        .fetch_optional(&s.db)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    require_project_manager(&s.db, &actor, decision.get("project_id")).await?;
+    if decision.get::<String, _>("status") == "confirmed" {
+        return Err(ApiError::BadRequest("已确认的决策不能修改指标".into()));
+    }
+    if req.metrics.is_empty() || req.metrics.iter().map(|m| m.weight_bps).sum::<i64>() != 10000 {
+        return Err(ApiError::BadRequest("指标权重之和必须为10000基点".into()));
+    }
+    if req.metrics.iter().any(|m| {
+        !(1..=10000).contains(&m.weight_bps)
+            || !["higher", "lower"].contains(&m.direction.as_str())
+    }) {
+        return Err(ApiError::BadRequest("指标方向或权重无效".into()));
+    }
+    let mut tx = s.db.begin().await?;
+    for m in &req.metrics {
+        let updated = sqlx::query(
+            "UPDATE decision_metrics SET weight_bps=?,direction=?,unit=?,threshold=? WHERE id=? AND decision_id=?",
+        )
+        .bind(m.weight_bps)
+        .bind(&m.direction)
+        .bind(&m.unit)
+        .bind(m.threshold)
+        .bind(m.id)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if updated == 0 {
+            return Err(ApiError::BadRequest("指标不属于该决策".into()));
+        }
+    }
+    tx.commit().await?;
+    log(&s.db, actor.id, "decision", Some(id), "update_metrics", "调整评价指标").await;
+    Ok(Json(json!({"ok":true})))
+}
 
 #[derive(Deserialize)]
 struct DashboardQuery {
@@ -1726,8 +1995,9 @@ async fn dashboard(
     let evm = evm_for(&s.db, pid).await?;
     let risks = risk_values(&s.db, pid).await?;
     let milestones=sqlx::query("SELECT id,name,end_date due_date,status FROM milestones WHERE project_id=? AND status<>'completed' ORDER BY end_date LIMIT 5").bind(pid).fetch_all(&s.db).await?;
-    let member_rows=sqlx::query("SELECT u.id,u.display_name name,pm.project_role role,u.hourly_rate_cents,COALESCE(tm.weekly_capacity_hours,40.0) capacity,COALESCE(SUM(t.estimated_hours),0.0) assigned_hours,COUNT(t.id) active_tasks FROM project_members pm JOIN users u ON u.id=pm.user_id JOIN projects p ON p.id=pm.project_id LEFT JOIN team_members tm ON tm.team_id=p.team_id AND tm.user_id=u.id LEFT JOIN tasks t ON t.project_id=pm.project_id AND t.assignee_id=u.id AND t.status<>'done' WHERE pm.project_id=? GROUP BY u.id,u.display_name,pm.project_role,u.hourly_rate_cents,tm.weekly_capacity_hours ORDER BY assigned_hours DESC").bind(pid).fetch_all(&s.db).await?;
-    let member_loads=member_rows.iter().map(|r|{let assigned:f64=r.get("assigned_hours");let capacity:f64=r.get("capacity");json!({"id":r.get::<i64,_>("id"),"name":r.get::<String,_>("name"),"role":r.get::<String,_>("role"),"hourly_rate":cents_to_yuan(r.get("hourly_rate_cents")),"assigned_hours":assigned,"available_hours":capacity,"capacity":capacity,"load_rate":if capacity>0.0{assigned/capacity*100.0}else{0.0},"active_tasks":r.get::<i64,_>("active_tasks")})}).collect::<Vec<_>>();
+    let member_rows=sqlx::query("SELECT u.id,u.display_name name,pm.project_role role,u.hourly_rate_cents,COALESCE(tm.weekly_capacity_hours,40.0) capacity,COUNT(t.id) active_tasks FROM project_members pm JOIN users u ON u.id=pm.user_id JOIN projects p ON p.id=pm.project_id LEFT JOIN team_members tm ON tm.team_id=p.team_id AND tm.user_id=u.id LEFT JOIN tasks t ON t.project_id=pm.project_id AND t.assignee_id=u.id AND t.status<>'done' WHERE pm.project_id=? GROUP BY u.id,u.display_name,pm.project_role,u.hourly_rate_cents,tm.weekly_capacity_hours ORDER BY u.id").bind(pid).fetch_all(&s.db).await?;
+    let dashboard_peak_loads = build_allocation_plan(&s.db, pid).await.ok().map(|plan| plan.member_impacts.into_iter().map(|impact|(impact.user_id,impact.before_peak_load)).collect::<std::collections::HashMap<_,_>>()).unwrap_or_default();
+    let member_loads=member_rows.iter().map(|r|{let capacity:f64=r.get("capacity");let load_rate=dashboard_peak_loads.get(&r.get::<i64,_>("id")).copied().unwrap_or(0.0);json!({"id":r.get::<i64,_>("id"),"name":r.get::<String,_>("name"),"role":r.get::<String,_>("role"),"hourly_rate":cents_to_yuan(r.get("hourly_rate_cents")),"assigned_hours":capacity*load_rate/100.0,"available_hours":capacity,"capacity":capacity,"load_rate":load_rate,"active_tasks":r.get::<i64,_>("active_tasks")})}).collect::<Vec<_>>();
     let trend_rows=sqlx::query("SELECT cost_date,SUM(value_cents) value_cents FROM (SELECT w.work_date cost_date,w.hours*u.hourly_rate_cents value_cents FROM worklogs w JOIN tasks t ON t.id=w.task_id JOIN users u ON u.id=w.user_id WHERE t.project_id=? UNION ALL SELECT occurred_on cost_date,CAST(amount_cents AS REAL) value_cents FROM expenses WHERE project_id=?) GROUP BY cost_date ORDER BY cost_date").bind(pid).bind(pid).fetch_all(&s.db).await?;
     let mut cumulative_cents = 0.0;
     let mut cost_trend = Vec::new();
@@ -1968,6 +2238,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manager_can_preview_and_apply_smart_allocation() {
+        let app = seeded_app().await;
+        let manager = login_as(&app, "manager").await;
+        let created = authed(
+            &app,
+            "POST",
+            "/api/projects/1/tasks",
+            &manager,
+            json!({"milestone_id":3,"title":"新增测试任务","description":"","acceptance_criteria":"","assignee_id":null,"participant_ids":[],"priority":"high","planned_start":"2026-10-01","planned_end":"2026-10-05","estimated_hours":16}),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created_id = serde_json::from_slice::<Value>(
+            &created.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        let preview = authed(
+            &app,
+            "GET",
+            "/api/projects/1/allocation/preview",
+            &manager,
+            json!({}),
+        )
+        .await;
+        assert_eq!(preview.status(), StatusCode::OK);
+        let plan: Value =
+            serde_json::from_slice(&preview.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert!(!plan["assignments"].as_array().unwrap().is_empty());
+        assert!(plan["assignments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|assignment| assignment["task_id"] == created_id));
+
+        let applied = authed(
+            &app,
+            "POST",
+            "/api/projects/1/allocation/apply",
+            &manager,
+            json!({}),
+        )
+        .await;
+        assert_eq!(applied.status(), StatusCode::OK);
+        let result: Value =
+            serde_json::from_slice(&applied.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(result["applied_count"], 1);
+    }
+
+    #[tokio::test]
     async fn decision_get_returns_normalized_score_dictionary() {
         let app = seeded_app().await;
         let manager = login_as(&app, "manager").await;
@@ -1986,5 +2309,139 @@ mod tests {
         let scores = value["results"][0]["scores"].as_object().unwrap();
         assert!(scores.contains_key("feasibility"));
         assert!(scores.contains_key("security"));
+    }
+
+    #[tokio::test]
+    async fn decision_threshold_marks_infeasible_and_excludes_from_recommendation() {
+        let app = seeded_app().await;
+        let manager = login_as(&app, "manager").await;
+        // 安全性(higher)要求 >= 70；方案 B 安全性 55 违反，应被标记不可行。
+        let created = authed(
+            &app,
+            "POST",
+            "/api/decisions",
+            &manager,
+            json!({
+                "project_id": 1,
+                "title": "硬约束测试",
+                "description": "",
+                "analysis_years": 1,
+                "metrics": [
+                    {"name":"安全性","weight_bps":5000,"direction":"higher","unit":"分","threshold":70.0},
+                    {"name":"开发周期","weight_bps":5000,"direction":"lower","unit":"天"}
+                ],
+                "options": [
+                    {"name":"方案A","description":"","initial_cost_cents":10000,"development_cost_cents":0,"annual_operation_cost_cents":0,"risk_probability_bps":0,"risk_loss_cents":0,"expected_benefit_cents":0,"values":[88.0,30.0]},
+                    {"name":"方案B","description":"","initial_cost_cents":10000,"development_cost_cents":0,"annual_operation_cost_cents":0,"risk_probability_bps":0,"risk_loss_cents":0,"expected_benefit_cents":0,"values":[55.0,20.0]}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let id = serde_json::from_slice::<Value>(
+            &created.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap()["id"]
+            .as_i64()
+            .unwrap();
+
+        let evaluated = authed(
+            &app,
+            "POST",
+            &format!("/api/decisions/{id}/evaluate"),
+            &manager,
+            json!({}),
+        )
+        .await;
+        assert_eq!(evaluated.status(), StatusCode::OK);
+        let body = serde_json::from_slice::<Value>(
+            &evaluated.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap();
+        // 推荐必须落在可行方案上。
+        let recommended = body["recommended_option_id"].as_i64().unwrap();
+        let results = body["results"].as_array().unwrap();
+        let top = &results[0];
+        assert_eq!(top["option_name"], "方案A");
+        assert_eq!(top["feasible"], true);
+        assert_eq!(top["option_id"].as_i64().unwrap(), recommended);
+        // 方案 B 被标记不可行，排在后面，并列出违反的指标。
+        let infeasible = results
+            .iter()
+            .find(|r| r["option_name"] == "方案B")
+            .unwrap();
+        assert_eq!(infeasible["feasible"], false);
+        assert!(infeasible["violations"].as_array().unwrap().contains(&json!("安全性")));
+        // 不可行方案排在可行方案之后。
+        assert!(infeasible["rank"].as_i64().unwrap() > top["rank"].as_i64().unwrap());
+    }
+
+    #[tokio::test]
+    async fn decision_metrics_can_be_updated_and_threshold_returned() {
+        let app = seeded_app().await;
+        let manager = login_as(&app, "manager").await;
+        let created = authed(
+            &app,
+            "POST",
+            "/api/decisions",
+            &manager,
+            json!({
+                "project_id": 1,
+                "title": "更新指标测试",
+                "description": "",
+                "analysis_years": 1,
+                "metrics": [
+                    {"name":"安全性","weight_bps":5000,"direction":"higher","unit":"分","threshold":70.0},
+                    {"name":"开发周期","weight_bps":5000,"direction":"lower","unit":"天"}
+                ],
+                "options": [
+                    {"name":"方案A","description":"","initial_cost_cents":10000,"development_cost_cents":0,"annual_operation_cost_cents":0,"risk_probability_bps":0,"risk_loss_cents":0,"expected_benefit_cents":0,"values":[88.0,30.0]},
+                    {"name":"方案B","description":"","initial_cost_cents":10000,"development_cost_cents":0,"annual_operation_cost_cents":0,"risk_probability_bps":0,"risk_loss_cents":0,"expected_benefit_cents":0,"values":[55.0,20.0]}
+                ]
+            }),
+        )
+        .await;
+        let id = serde_json::from_slice::<Value>(
+            &created.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        // 读取指标 id 与返回的 threshold。
+        let detail = authed(&app, "GET", &format!("/api/decisions/{id}"), &manager, json!({})).await;
+        let value: Value = serde_json::from_slice(
+            &detail.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap();
+        let metrics = value["metrics"].as_array().unwrap();
+        assert_eq!(metrics[0]["threshold"], 70.0);
+        assert!(metrics[1]["threshold"].is_null());
+        let security_id = metrics[0]["id"].as_i64().unwrap();
+        let duration_id = metrics[1]["id"].as_i64().unwrap();
+
+        // 更新：安全性阈值降到 50，开发周期加阈值 40。
+        let updated = authed(
+            &app,
+            "PUT",
+            &format!("/api/decisions/{id}/metrics"),
+            &manager,
+            json!({"metrics":[
+                {"id":security_id,"weight_bps":6000,"direction":"higher","unit":"分","threshold":50.0},
+                {"id":duration_id,"weight_bps":4000,"direction":"lower","unit":"天","threshold":40.0}
+            ]}),
+        )
+        .await;
+        assert_eq!(updated.status(), StatusCode::OK);
+
+        let detail2 = authed(&app, "GET", &format!("/api/decisions/{id}"), &manager, json!({})).await;
+        let value2: Value = serde_json::from_slice(
+            &detail2.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap();
+        let m2 = value2["metrics"].as_array().unwrap();
+        assert_eq!(m2[0]["threshold"], 50.0);
+        assert_eq!(m2[0]["weight"], 60.0);
+        assert_eq!(m2[1]["threshold"], 40.0);
+        assert_eq!(m2[1]["weight"], 40.0);
     }
 }

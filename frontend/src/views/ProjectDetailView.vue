@@ -21,6 +21,12 @@ const members = ref<MemberLoad[]>([]);
 const loading = ref(true);
 const error = ref("");
 const dialog = ref("");
+const dialogVisible = computed({
+  get: () => dialog.value !== "",
+  set: (visible: boolean) => {
+    if (!visible) dialog.value = "";
+  },
+});
 const milestone = reactive({
   name: "",
   description: "",
@@ -225,7 +231,7 @@ onMounted(load);
         </div> </template
     ></PageState>
     <el-dialog
-      v-model="dialog"
+      v-model="dialogVisible"
       :title="
         dialog === 'edit'
           ? '编辑项目'
