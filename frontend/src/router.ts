@@ -1,4 +1,4 @@
-import { createRouter, createWebHistory } from 'vue-router'
+import { createRouter, createWebHashHistory, createWebHistory } from 'vue-router'
 import { useAuthStore } from './stores/auth'
 
 const routes = [
@@ -17,11 +17,13 @@ const routes = [
   { path: '/:pathMatch(.*)*', redirect: '/' },
 ]
 
-const router = createRouter({ history: createWebHistory(), routes })
+const router = createRouter({
+  history: location.protocol === 'file:' ? createWebHashHistory() : createWebHistory(),
+  routes,
+})
 router.beforeEach((to) => {
   const auth = useAuthStore()
   if (!to.meta.public && !auth.authenticated) return `/login?redirect=${encodeURIComponent(to.fullPath)}`
   if (to.path === '/login' && auth.authenticated) return '/dashboard'
 })
 export default router
-

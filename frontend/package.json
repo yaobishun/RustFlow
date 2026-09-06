@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc -b && vite build",
+    "build:single": "vue-tsc -b && node scripts/build-single-html.mjs",
+    "build:showcase": "npm run build:single && node scripts/build-static-showcase.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

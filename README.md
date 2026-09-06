@@ -1,6 +1,8 @@
-# RustFlow：企业研发项目协同与成本决策平台
+# RustFlow：基于 Rust 的研发团队协同与工程决策支持系统
 
-RustFlow 是一个面向企业内部研发团队的课程实践项目。系统以研发任务协作为主线，将项目计划、任务评审、工时成本、挣值管理（EVM）、依赖风险传播和技术方案经济评价放在同一套工作流中。
+RustFlow 是“基于 Rust 的研发团队协同与工程决策支持系统的设计与实现”课程实践项目，面向企业内部的中小型研发团队。系统以研发任务协作为主线，将项目计划、任务评审、工时成本、挣值管理（EVM）、依赖风险传播和技术方案经济评价组织在同一套工作流中，为项目负责人提供进度分析、成本预警和技术方案决策支持。
+
+项目仓库：<https://github.com/yaobishun/RustFlow>
 
 > 本仓库交付的是可落地的基础版，不包含人员智能推荐、研发设备管理、决策敏感性分析、报告导出、大模型助手、考勤、请假、即时聊天和在线文档。
 
@@ -53,7 +55,7 @@ cd D:\RustFlow
 首次运行时，脚本会在缺少前端依赖时执行 `npm install`，并分别启动后端和前端。默认访问地址：
 
 - 前端：<http://127.0.0.1:5173>
-- 后端健康检查：<http://127.0.0.1:3000/health>
+- 后端健康检查：<http://127.0.0.1:3100/health>
 
 演示账号由后端首次初始化生成，密码统一为 `RustFlow123!`：`admin`、`manager`、`dev`、`reviewer`。
 
@@ -63,7 +65,37 @@ cd D:\RustFlow
 ./stop.ps1
 ```
 
-脚本输出与进程号保存在 `.run/`。也可分别进入 `backend` 执行 `cargo run`、进入 `frontend` 执行 `npm install` 和 `npm run dev` 手动启动。后端默认数据库为 `backend/rustflow.db`，前端 `/api` 默认代理到 `http://127.0.0.1:3000`。
+脚本输出与进程号保存在 `.run/`。项目启动脚本统一使用 `3100` 端口运行后端，前端 `/api` 也代理到 `http://127.0.0.1:3100`。如需手动启动，可分别执行：
+
+```powershell
+cd D:\RustFlow\backend
+$env:BIND_ADDR = '127.0.0.1:3100'
+cargo run
+
+cd ..\frontend
+npm install
+npm run dev
+```
+
+后端默认数据库文件为 `backend/rustflow.db`。
+
+## 前端构建与静态展示
+
+进入 `frontend` 目录后，可以按使用场景选择构建方式：
+
+```powershell
+# 常规生产构建，输出到 frontend/dist
+npm run build
+
+# 单文件交互版，输出到 frontend/dist-single/RustFlow.html
+npm run build:single
+
+# 全页面静态展示版，输出到 frontend/dist-showcase
+# 生成时需要先启动 3100 端口的后端，并确保本机安装 Microsoft Edge
+npm run build:showcase
+```
+
+单文件交互版包含完整前端程序，直接打开时默认连接 `http://127.0.0.1:3100/api`；全页面静态展示版则将主要页面依次展开并内嵌到一个长 HTML 中，生成完成后可以脱离后端直接浏览。
 
 提交前可分别执行：
 
@@ -83,7 +115,7 @@ npm run build
 - [系统架构、数据模型与接口约定](docs/architecture-and-data-model.md)
 - [前端功能与交互说明](docs/frontend-interaction.md)
 - [课程要求对应、团队分工与过程证据](docs/course-mapping-and-teamwork.md)
-- [答辩演示流程](docs/demo-script.md)
+- [项目演示流程](docs/demo-script.md)
 
 ## 课程要求概览
 

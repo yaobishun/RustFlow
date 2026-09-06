@@ -1,7 +1,10 @@
 import axios, { AxiosError } from "axios";
 
+const defaultApiBase =
+  location.protocol === "file:" ? "http://127.0.0.1:3100/api" : "/api";
+
 export const http = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE || "/api",
+  baseURL: import.meta.env.VITE_API_BASE || defaultApiBase,
   timeout: 12000,
 });
 
